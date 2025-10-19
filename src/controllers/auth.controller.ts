@@ -36,7 +36,7 @@ export class AuthController {
         }
     }
 
-    async setup2FA(req: any, res: Response) {
+    async setup2FA(req: Request, res: Response) {
         try {
             const userId = req.user!.userId || '';
             const result = await authService.setup2FA(userId);
@@ -46,7 +46,7 @@ export class AuthController {
         }
     }
 
-    async verify2FASetup(req: any, res: Response) {
+    async verify2FASetup(req: Request, res: Response) {
         try {
             const userId = req.user!.userId;
             const { token } = req.body;
@@ -115,7 +115,7 @@ export class AuthController {
         }
     }
 
-    async getProfile(req: any, res: Response) {
+    async getProfile(req: Request, res: Response) {
         try {
             const userId = req.user!.userId;
             const role = req.user!.role;
