@@ -1,12 +1,12 @@
 // src/services/auth.service.ts
-import pool from '../config/database';
+import { Role } from '@prisma/client';
+import prisma from '../lib/prisma';
 import redisClient from '../config/redis';
 import { hashPassword, comparePassword } from '../utils/password.utils';
 import { generateAccessToken, generateRefreshToken } from '../utils/jwt.utils';
 import crypto from 'crypto';
 import speakeasy from 'speakeasy';
 import QRCode from 'qrcode';
-import * as jwt from 'jsonwebtoken';
 
 export interface RegisterUserDto {
     email: string;
@@ -17,445 +17,606 @@ export interface RegisterUserDto {
     // Doctor specific
     specialization?: string;
     licenseNumber?: string;
+    experienceYears?: number;
+    consultationFee?: number;
+    bio?: string;
     // Patient specific
     dateOfBirth?: string;
     gender?: string;
+    bloodGroup?: string;
+    address?: string;
+    emergencyContact?: string;
 }
 
 export class AuthService {
-    // Register new user
+    /**
+     * Register a new user (patient or doctor)
+     */
     async register(data: RegisterUserDto) {
-        const client = await pool.connect();
-
         try {
-            await client.query('BEGIN');
+            // Check if user already exists
+            const existingUser = await prisma.user.findUnique({
+                where: { email: data.email.toLowerCase() },
+            });
 
-            // Check if user exists
-            const existingUser = await client.query(
-                'SELECT id FROM users WHERE email = $1',
-                [data.email]
-            );
-
-            if (existingUser.rows.length > 0) {
+            if (existingUser) {
                 throw new Error('Email already registered');
             }
 
             // Hash password
             const passwordHash = await hashPassword(data.password);
 
-            // Create user
-            const userResult = await client.query(
-                `INSERT INTO users (email, password_hash, role) 
-         VALUES ($1, $2, $3) 
-         RETURNING id, email, role, created_at`,
-                [data.email, passwordHash, data.role]
-            );
+            // Create user with profile in a transaction
+            const user = await prisma.$transaction(async (tx) => {
+                // Create user
+                const newUser = await tx.user.create({
+                    data: {
+                        email: data.email.toLowerCase(),
+                        passwordHash,
+                        role: data.role as Role,
+                    },
+                });
 
-            const user = userResult.rows[0];
+                // Create profile based on role
+                if (data.role === 'doctor') {
+                    if (!data.specialization || !data.licenseNumber) {
+                        throw new Error('Specialization and license number are required for doctors');
+                    }
 
-            // Create profile based on role
-            if (data.role === 'doctor') {
-                await client.query(
-                    `INSERT INTO doctor_profiles (user_id, full_name, specialization, license_number, phone) 
-           VALUES ($1, $2, $3, $4, $5)`,
-                    [user.id, data.fullName, data.specialization, data.licenseNumber, data.phone]
-                );
-            } else {
-                await client.query(
-                    `INSERT INTO patient_profiles (user_id, full_name, phone, date_of_birth, gender) 
-           VALUES ($1, $2, $3, $4, $5)`,
-                    [user.id, data.fullName, data.phone, data.dateOfBirth || null, data.gender || null]
-                );
-            }
+                    await tx.doctorProfile.create({
+                        data: {
+                            userId: newUser.id,
+                            fullName: data.fullName,
+                            specialization: data.specialization,
+                            licenseNumber: data.licenseNumber,
+                            experienceYears: data.experienceYears,
+                            consultationFee: data.consultationFee,
+                            bio: data.bio,
+                            phone: data.phone,
+                        },
+                    });
+                } else if (data.role === 'patient') {
+                    await tx.patientProfile.create({
+                        data: {
+                            userId: newUser.id,
+                            fullName: data.fullName,
+                            phone: data.phone,
+                            dateOfBirth: data.dateOfBirth ? new Date(data.dateOfBirth) : null,
+                            gender: data.gender,
+                            bloodGroup: data.bloodGroup,
+                            address: data.address,
+                            emergencyContact: data.emergencyContact,
+                        },
+                    });
+                }
 
-            // Generate email verification token
-            const verificationToken = crypto.randomBytes(32).toString('hex');
-            const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+                // Generate email verification token
+                const verificationToken = crypto.randomBytes(32).toString('hex');
+                const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
 
-            await client.query(
-                `INSERT INTO email_verification_tokens (user_id, token, expires_at) 
-         VALUES ($1, $2, $3)`,
-                [user.id, verificationToken, expiresAt]
-            );
+                await tx.emailVerificationToken.create({
+                    data: {
+                        userId: newUser.id,
+                        token: verificationToken,
+                        expiresAt,
+                    },
+                });
 
-            await client.query('COMMIT');
+                return { user: newUser, verificationToken };
+            });
 
             // TODO: Send verification email
-            // await emailService.sendVerificationEmail(user.email, verificationToken);
+            console.log(`📧 Verification token: ${user.verificationToken}`);
 
             return {
                 user: {
-                    id: user.id,
-                    email: user.email,
-                    role: user.role
+                    id: user.user.id,
+                    email: user.user.email,
+                    role: user.user.role,
                 },
-                message: 'Registration successful. Please check your email to verify your account.'
+                message: 'Registration successful. Please check your email to verify your account.',
             };
-        } catch (error) {
-            await client.query('ROLLBACK');
+        } catch (error: any) {
+            console.error('Registration error:', error);
             throw error;
-        } finally {
-            client.release();
         }
     }
 
-    // Login with email and password
+    /**
+     * Login with email and password
+     */
     async login(email: string, password: string) {
-        // Get user
-        const userResult = await pool.query(
-            `SELECT id, email, password_hash, role, is_email_verified, is_active, two_factor_enabled 
-       FROM users WHERE email = $1`,
-            [email]
-        );
+        try {
+            // Find user
+            const user = await prisma.user.findUnique({
+                where: { email: email.toLowerCase() },
+            });
 
-        if (userResult.rows.length === 0) {
-            throw new Error('Invalid credentials');
-        }
+            if (!user || !user.passwordHash) {
+                throw new Error('Invalid credentials');
+            }
 
-        const user = userResult.rows[0];
+            // Check if account is active
+            if (!user.isActive) {
+                throw new Error('Account is deactivated');
+            }
 
-        // Check if account is active
-        if (!user.is_active) {
-            throw new Error('Account is deactivated');
-        }
+            // Verify password
+            const isValidPassword = await comparePassword(password, user.passwordHash);
+            if (!isValidPassword) {
+                throw new Error('Invalid credentials');
+            }
 
-        // Verify password
-        const isValidPassword = await comparePassword(password, user.password_hash);
-        if (!isValidPassword) {
-            throw new Error('Invalid credentials');
-        }
+            // Check email verification
+            if (!user.isEmailVerified) {
+                throw new Error('Please verify your email first');
+            }
 
-        // Check email verification
-        if (!user.is_email_verified) {
-            throw new Error('Please verify your email first');
-        }
+            // If 2FA is enabled, return temp token
+            if (user.twoFactorEnabled) {
+                const tempToken = crypto.randomBytes(32).toString('hex');
 
-        // If 2FA is enabled, return a temp token
-        if (user.two_factor_enabled) {
-            const tempToken = crypto.randomBytes(32).toString('hex');
+                await redisClient.setEx(
+                    `2fa:${tempToken}`,
+                    300, // 5 minutes
+                    JSON.stringify({ userId: user.id, email: user.email, role: user.role })
+                );
 
-            // Store temp token in Redis (expires in 5 minutes)
-            await redisClient.setEx(
-                `2fa:${tempToken}`,
-                300,
-                JSON.stringify({ userId: user.id, email: user.email, role: user.role })
-            );
+                return {
+                    requiresTwoFactor: true,
+                    tempToken,
+                    message: 'Please enter your 2FA code',
+                };
+            }
+
+            // Generate tokens
+            const accessToken = generateAccessToken({
+                userId: user.id,
+                email: user.email,
+                role: user.role,
+            });
+
+            const refreshToken = generateRefreshToken({
+                userId: user.id,
+                email: user.email,
+                role: user.role,
+            });
+
+            // Store refresh token in database
+            await prisma.refreshToken.create({
+                data: {
+                    userId: user.id,
+                    token: refreshToken,
+                    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+                },
+            });
 
             return {
-                requiresTwoFactor: true,
-                tempToken,
-                message: 'Please enter your 2FA code'
+                accessToken,
+                refreshToken,
+                user: {
+                    id: user.id,
+                    email: user.email,
+                    role: user.role,
+                },
             };
+        } catch (error: any) {
+            console.error('Login error:', error);
+            throw error;
         }
-
-        // Generate tokens
-        const accessToken = generateAccessToken({
-            userId: user.id,
-            email: user.email,
-            role: user.role
-        });
-
-        const refreshToken = generateRefreshToken({
-            userId: user.id,
-            email: user.email,
-            role: user.role
-        });
-
-        // Store refresh token
-        const refreshExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-        await pool.query(
-            `INSERT INTO refresh_tokens (user_id, token, expires_at) 
-       VALUES ($1, $2, $3)`,
-            [user.id, refreshToken, refreshExpiresAt]
-        );
-
-        return {
-            accessToken,
-            refreshToken,
-            user: {
-                id: user.id,
-                email: user.email,
-                role: user.role
-            }
-        };
     }
 
-    // Setup 2FA
+    /**
+     * Setup 2FA for a user
+     */
     async setup2FA(userId: string) {
-        // Generate secret
-        const secret = speakeasy.generateSecret({
-            name: `${process.env.TWO_FACTOR_ISSUER} (${userId})`,
-            length: 32
-        });
+        try {
+            // Generate secret
+            const secret = speakeasy.generateSecret({
+                name: `${process.env.TWO_FACTOR_ISSUER} (${userId})`,
+                length: 32,
+            });
 
-        // Store secret temporarily in Redis (expires in 10 minutes)
-        await redisClient.setEx(
-            `2fa-setup:${userId}`,
-            600,
-            secret.base32
-        );
+            // Store secret temporarily in Redis (10 minutes)
+            await redisClient.setEx(`2fa-setup:${userId}`, 600, secret.base32);
 
-        // Generate QR code
-        const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url!);
+            // Generate QR code
+            const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url!);
 
-        return {
-            secret: secret.base32,
-            qrCode: qrCodeUrl,
-            message: 'Scan this QR code with your authenticator app'
-        };
+            return {
+                secret: secret.base32,
+                qrCode: qrCodeUrl,
+                message: 'Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.)',
+            };
+        } catch (error: any) {
+            console.error('Setup 2FA error:', error);
+            throw error;
+        }
     }
 
-    // Verify and enable 2FA
+    /**
+     * Verify and enable 2FA
+     */
     async verify2FASetup(userId: string, token: string) {
-        // Get secret from Redis
-        const secret = await redisClient.get(`2fa-setup:${userId}`);
+        try {
+            // Get secret from Redis
+            const secret = await redisClient.get(`2fa-setup:${userId}`);
 
-        if (!secret) {
-            throw new Error('2FA setup session expired. Please start again.');
+            if (!secret) {
+                throw new Error('2FA setup session expired. Please start again.');
+            }
+
+            // Verify token
+            const isValid = speakeasy.totp.verify({
+                secret,
+                encoding: 'base32',
+                token,
+                window: 2, // Allow 2 time steps before/after
+            });
+
+            if (!isValid) {
+                throw new Error('Invalid 2FA code');
+            }
+
+            // Save secret to database and enable 2FA
+            await prisma.user.update({
+                where: { id: userId },
+                data: {
+                    twoFactorSecret: secret,
+                    twoFactorEnabled: true,
+                },
+            });
+
+            // Delete temp secret from Redis
+            await redisClient.del(`2fa-setup:${userId}`);
+
+            return {
+                message: '2FA enabled successfully. You will need to use your authenticator app on future logins.',
+            };
+        } catch (error: any) {
+            console.error('Verify 2FA setup error:', error);
+            throw error;
         }
-
-        // Verify token
-        const isValid = speakeasy.totp.verify({
-            secret,
-            encoding: 'base32',
-            token,
-            window: 2
-        });
-
-        if (!isValid) {
-            throw new Error('Invalid 2FA code');
-        }
-
-        // Save secret to database and enable 2FA
-        await pool.query(
-            `UPDATE users 
-       SET two_factor_secret = $1, two_factor_enabled = true 
-       WHERE id = $2`,
-            [secret, userId]
-        );
-
-        // Delete temp secret from Redis
-        await redisClient.del(`2fa-setup:${userId}`);
-
-        return {
-            message: '2FA enabled successfully'
-        };
     }
 
-    // Verify 2FA during login
+    /**
+     * Verify 2FA code during login
+     */
     async verify2FALogin(tempToken: string, token: string) {
-        // Get user data from Redis
-        const userData = await redisClient.get(`2fa:${tempToken}`);
+        try {
+            // Get user data from Redis
+            const userData = await redisClient.get(`2fa:${tempToken}`);
 
-        if (!userData) {
-            throw new Error('Invalid or expired session');
+            if (!userData) {
+                throw new Error('Invalid or expired session');
+            }
+
+            const { userId, email, role } = JSON.parse(userData);
+
+            // Get user's 2FA secret
+            const user = await prisma.user.findUnique({
+                where: { id: userId },
+                select: { twoFactorSecret: true },
+            });
+
+            if (!user || !user.twoFactorSecret) {
+                throw new Error('User not found or 2FA not enabled');
+            }
+
+            // Verify token
+            const isValid = speakeasy.totp.verify({
+                secret: user.twoFactorSecret,
+                encoding: 'base32',
+                token,
+                window: 2,
+            });
+
+            if (!isValid) {
+                throw new Error('Invalid 2FA code');
+            }
+
+            // Delete temp token
+            await redisClient.del(`2fa:${tempToken}`);
+
+            // Generate tokens
+            const accessToken = generateAccessToken({ userId, email, role });
+            const refreshToken = generateRefreshToken({ userId, email, role });
+
+            // Store refresh token
+            await prisma.refreshToken.create({
+                data: {
+                    userId,
+                    token: refreshToken,
+                    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+                },
+            });
+
+            return {
+                accessToken,
+                refreshToken,
+                user: { id: userId, email, role },
+            };
+        } catch (error: any) {
+            console.error('Verify 2FA login error:', error);
+            throw error;
         }
-
-        const { userId, email, role } = JSON.parse(userData);
-
-        // Get user's 2FA secret
-        const userResult = await pool.query(
-            'SELECT two_factor_secret FROM users WHERE id = $1',
-            [userId]
-        );
-
-        if (userResult.rows.length === 0) {
-            throw new Error('User not found');
-        }
-
-        const { two_factor_secret } = userResult.rows[0];
-
-        // Verify token
-        const isValid = speakeasy.totp.verify({
-            secret: two_factor_secret,
-            encoding: 'base32',
-            token,
-            window: 2
-        });
-
-        if (!isValid) {
-            throw new Error('Invalid 2FA code');
-        }
-
-        // Delete temp token
-        await redisClient.del(`2fa:${tempToken}`);
-
-        // Generate tokens
-        const accessToken = generateAccessToken({ userId, email, role });
-        const refreshToken = generateRefreshToken({ userId, email, role });
-
-        // Store refresh token
-        const refreshExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-        await pool.query(
-            `INSERT INTO refresh_tokens (user_id, token, expires_at) 
-       VALUES ($1, $2, $3)`,
-            [userId, refreshToken, refreshExpiresAt]
-        );
-
-        return {
-            accessToken,
-            refreshToken,
-            user: { id: userId, email, role }
-        };
     }
 
-    // Verify email
+    /**
+     * Disable 2FA for a user
+     */
+    async disable2FA(userId: string, password: string) {
+        try {
+            // Verify password
+            const user = await prisma.user.findUnique({
+                where: { id: userId },
+            });
+
+            if (!user || !user.passwordHash) {
+                throw new Error('User not found');
+            }
+
+            const isValidPassword = await comparePassword(password, user.passwordHash);
+            if (!isValidPassword) {
+                throw new Error('Invalid password');
+            }
+
+            // Disable 2FA
+            await prisma.user.update({
+                where: { id: userId },
+                data: {
+                    twoFactorSecret: null,
+                    twoFactorEnabled: false,
+                },
+            });
+
+            return {
+                message: '2FA disabled successfully',
+            };
+        } catch (error: any) {
+            console.error('Disable 2FA error:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Verify email address
+     */
     async verifyEmail(token: string) {
-        const result = await pool.query(
-            `SELECT user_id, expires_at FROM email_verification_tokens 
-       WHERE token = $1`,
-            [token]
-        );
+        try {
+            // Find verification token
+            const verificationToken = await prisma.emailVerificationToken.findUnique({
+                where: { token },
+                include: { user: true },
+            });
 
-        if (result.rows.length === 0) {
-            throw new Error('Invalid verification token');
+            if (!verificationToken) {
+                throw new Error('Invalid verification token');
+            }
+
+            // Check if expired
+            if (new Date() > verificationToken.expiresAt) {
+                throw new Error('Verification token expired');
+            }
+
+            // Update user and delete token in transaction
+            await prisma.$transaction([
+                prisma.user.update({
+                    where: { id: verificationToken.userId },
+                    data: { isEmailVerified: true },
+                }),
+                prisma.emailVerificationToken.delete({
+                    where: { id: verificationToken.id },
+                }),
+            ]);
+
+            return {
+                message: 'Email verified successfully. You can now log in.',
+            };
+        } catch (error: any) {
+            console.error('Verify email error:', error);
+            throw error;
         }
-
-        const { user_id, expires_at } = result.rows[0];
-
-        if (new Date() > new Date(expires_at)) {
-            throw new Error('Verification token expired');
-        }
-
-        // Update user
-        await pool.query(
-            'UPDATE users SET is_email_verified = true WHERE id = $1',
-            [user_id]
-        );
-
-        // Delete token
-        await pool.query(
-            'DELETE FROM email_verification_tokens WHERE token = $1',
-            [token]
-        );
-
-        return { message: 'Email verified successfully' };
     }
 
-    // Google OAuth login/register
+    /**
+     * Resend email verification
+     */
+    async resendVerificationEmail(email: string) {
+        try {
+            const user = await prisma.user.findUnique({
+                where: { email: email.toLowerCase() },
+            });
+
+            if (!user) {
+                throw new Error('User not found');
+            }
+
+            if (user.isEmailVerified) {
+                throw new Error('Email is already verified');
+            }
+
+            // Delete old tokens
+            await prisma.emailVerificationToken.deleteMany({
+                where: { userId: user.id },
+            });
+
+            // Generate new token
+            const verificationToken = crypto.randomBytes(32).toString('hex');
+            const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+            await prisma.emailVerificationToken.create({
+                data: {
+                    userId: user.id,
+                    token: verificationToken,
+                    expiresAt,
+                },
+            });
+
+            // TODO: Send email
+            console.log(`📧 Verification token: ${verificationToken}`);
+
+            return {
+                message: 'Verification email sent',
+            };
+        } catch (error: any) {
+            console.error('Resend verification error:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Google OAuth login/register
+     */
     async googleAuth(profile: any) {
-        const { id: googleId, emails, displayName } = profile;
-        const email = emails[0].value;
+        try {
+            const { id: googleId, emails, displayName } = profile;
+            const email = emails[0].value.toLowerCase();
 
-        // Check if user exists
-        let userResult = await pool.query(
-            'SELECT id, email, role, is_active FROM users WHERE google_id = $1 OR email = $2',
-            [googleId, email]
-        );
+            // Find or create user
+            let user = await prisma.user.findFirst({
+                where: {
+                    OR: [{ googleId }, { email }],
+                },
+            });
 
-        let user;
+            if (!user) {
+                // Create new user with patient profile
+                user = await prisma.$transaction(async (tx) => {
+                    const newUser = await tx.user.create({
+                        data: {
+                            email,
+                            googleId,
+                            role: Role.patient,
+                            isEmailVerified: true, // Email is verified by Google
+                        },
+                    });
 
-        if (userResult.rows.length === 0) {
-            // Create new user
-            const client = await pool.connect();
-            try {
-                await client.query('BEGIN');
+                    await tx.patientProfile.create({
+                        data: {
+                            userId: newUser.id,
+                            fullName: displayName || 'User',
+                        },
+                    });
 
-                const newUserResult = await client.query(
-                    `INSERT INTO users (email, google_id, role, is_email_verified) 
-           VALUES ($1, $2, 'patient', true) 
-           RETURNING id, email, role`,
-                    [email, googleId]
-                );
-
-                user = newUserResult.rows[0];
-
-                // Create patient profile
-                await client.query(
-                    `INSERT INTO patient_profiles (user_id, full_name) 
-           VALUES ($1, $2)`,
-                    [user.id, displayName]
-                );
-
-                await client.query('COMMIT');
-            } catch (error) {
-                await client.query('ROLLBACK');
-                throw error;
-            } finally {
-                client.release();
+                    return newUser;
+                });
+            } else if (!user.googleId) {
+                // Link Google account to existing user
+                user = await prisma.user.update({
+                    where: { id: user.id },
+                    data: {
+                        googleId,
+                        isEmailVerified: true, // Email verified by Google
+                    },
+                });
             }
-        } else {
-            user = userResult.rows[0];
 
-            // Update google_id if not set
-            if (!user.google_id) {
-                await pool.query(
-                    'UPDATE users SET google_id = $1 WHERE id = $2',
-                    [googleId, user.id]
-                );
+            // Check if account is active
+            if (!user.isActive) {
+                throw new Error('Account is deactivated');
             }
-        }
 
-        // Check if active
-        if (!user.is_active) {
-            throw new Error('Account is deactivated');
-        }
-
-        // Generate tokens
-        const accessToken = generateAccessToken({
-            userId: user.id,
-            email: user.email,
-            role: user.role
-        });
-
-        const refreshToken = generateRefreshToken({
-            userId: user.id,
-            email: user.email,
-            role: user.role
-        });
-
-        // Store refresh token
-        const refreshExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-        await pool.query(
-            `INSERT INTO refresh_tokens (user_id, token, expires_at) 
-       VALUES ($1, $2, $3)`,
-            [user.id, refreshToken, refreshExpiresAt]
-        );
-
-        return {
-            accessToken,
-            refreshToken,
-            user: {
-                id: user.id,
+            // Generate tokens
+            const accessToken = generateAccessToken({
+                userId: user.id,
                 email: user.email,
-                role: user.role
-            }
-        };
-    }
+                role: user.role,
+            });
 
-    // Refresh access token
-    async refreshAccessToken(refreshToken: string) {
-        // Verify refresh token
-        const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET!);
+            const refreshToken = generateRefreshToken({
+                userId: user.id,
+                email: user.email,
+                role: user.role,
+            });
 
-        // Check if token exists in database
-        const result = await pool.query(
-            `SELECT user_id FROM refresh_tokens 
-       WHERE token = $1 AND expires_at > NOW()`,
-            [refreshToken]
-        );
+            // Store refresh token
+            await prisma.refreshToken.create({
+                data: {
+                    userId: user.id,
+                    token: refreshToken,
+                    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+                },
+            });
 
-        if (result.rows.length === 0) {
-            throw new Error('Invalid refresh token');
+            return {
+                accessToken,
+                refreshToken,
+                user: {
+                    id: user.id,
+                    email: user.email,
+                    role: user.role,
+                },
+            };
+        } catch (error: any) {
+            console.error('Google auth error:', error);
+            throw error;
         }
-
-        // Generate new access token
-        // const accessToken = generateAccessToken({
-        //     userId: result?.userId || '',
-        //     email: result?.email,
-        //     role: result?.role
-        // });
-
-        return { accessToken: 'testToken' };
     }
 
-    // Logout
-    async logout(refreshToken: string) {
-        await pool.query(
-            'DELETE FROM refresh_tokens WHERE token = $1',
-            [refreshToken]
-        );
+    /**
+     * Refresh access token
+     */
+    async refreshAccessToken(refreshToken: string) {
+        try {
+            // Find refresh token in database
+            const tokenRecord = await prisma.refreshToken.findFirst({
+                where: {
+                    token: refreshToken,
+                    expiresAt: { gt: new Date() },
+                },
+                include: { user: true },
+            });
 
-        return { message: 'Logged out successfully' };
+            if (!tokenRecord) {
+                throw new Error('Invalid or expired refresh token');
+            }
+
+            // Generate new access token
+            const accessToken = generateAccessToken({
+                userId: tokenRecord.user.id,
+                email: tokenRecord.user.email,
+                role: tokenRecord.user.role,
+            });
+
+            return { accessToken };
+        } catch (error: any) {
+            console.error('Refresh token error:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Logout user
+     */
+    async logout(refreshToken: string) {
+        try {
+            // Delete refresh token from database
+            await prisma.refreshToken.deleteMany({
+                where: { token: refreshToken },
+            });
+
+            return { message: 'Logged out successfully' };
+        } catch (error: any) {
+            console.error('Logout error:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Logout from all devices
+     */
+    async logoutAllDevices(userId: string) {
+        try {
+            // Delete all refresh tokens for user
+            await prisma.refreshToken.deleteMany({
+                where: { userId },
+            });
+
+            return { message: 'Logged out from all devices' };
+        } catch (error: any) {
+            console.error('Logout all error:', error);
+            throw error;
+        }
     }
 }

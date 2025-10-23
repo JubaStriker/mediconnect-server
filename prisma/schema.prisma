@@ -1,0 +1,151 @@
+// prisma/schema.prisma
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+// ============================================
+// User Management
+// ============================================
+
+model User {
+    id               String   @id @default(uuid()) @db.Uuid
+    email            String   @unique @db.VarChar(255)
+    passwordHash     String?  @map("password_hash") @db.VarChar(255)
+    role             Role
+    isEmailVerified  Boolean  @default(false) @map("is_email_verified")
+    isActive         Boolean  @default(true) @map("is_active")
+    googleId         String?  @unique @map("google_id") @db.VarChar(255)
+    twoFactorSecret  String?  @map("two_factor_secret") @db.VarChar(255)
+    twoFactorEnabled Boolean  @default(false) @map("two_factor_enabled")
+    createdAt        DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+    updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamp(6)
+
+    // Relations
+    doctorProfile           DoctorProfile?
+    patientProfile          PatientProfile?
+    emailVerificationTokens EmailVerificationToken[]
+    passwordResetTokens     PasswordResetToken[]
+    refreshTokens           RefreshToken[]
+
+    @@index([email])
+    @@index([googleId])
+    @@index([role])
+    @@map("users")
+}
+
+enum Role {
+    patient
+    doctor
+    admin
+}
+
+// ============================================
+// Doctor Profile
+// ============================================
+
+model DoctorProfile {
+    id              String   @id @default(uuid()) @db.Uuid
+    userId          String   @unique @map("user_id") @db.Uuid
+    fullName        String   @map("full_name") @db.VarChar(255)
+    specialization  String   @db.VarChar(100)
+    licenseNumber   String   @unique @map("license_number") @db.VarChar(100)
+    experienceYears Int?     @map("experience_years")
+    consultationFee Decimal? @map("consultation_fee") @db.Decimal(10, 2)
+    bio             String?  @db.Text
+    phone           String?  @db.VarChar(20)
+    isVerified      Boolean  @default(false) @map("is_verified")
+    createdAt       DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+    updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamp(6)
+
+    // Relations
+    user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@index([userId])
+    @@index([specialization])
+    @@map("doctor_profiles")
+}
+
+// ============================================
+// Patient Profile
+// ============================================
+
+model PatientProfile {
+    id               String    @id @default(uuid()) @db.Uuid
+    userId           String    @unique @map("user_id") @db.Uuid
+    fullName         String    @map("full_name") @db.VarChar(255)
+    dateOfBirth      DateTime? @map("date_of_birth") @db.Date
+    gender           String?   @db.VarChar(20)
+    bloodGroup       String?   @map("blood_group") @db.VarChar(5)
+    phone            String?   @db.VarChar(20)
+    address          String?   @db.Text
+    emergencyContact String?   @map("emergency_contact") @db.VarChar(20)
+    createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamp(6)
+    updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamp(6)
+
+    // Relations
+    user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@index([userId])
+    @@map("patient_profiles")
+}
+
+// ============================================
+// Email Verification
+// ============================================
+
+model EmailVerificationToken {
+    id        String   @id @default(uuid()) @db.Uuid
+    userId    String   @map("user_id") @db.Uuid
+    token     String   @unique @db.VarChar(255)
+    expiresAt DateTime @map("expires_at") @db.Timestamp(6)
+    createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+
+    // Relations
+    user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@index([userId])
+    @@index([token])
+    @@map("email_verification_tokens")
+}
+
+// ============================================
+// Password Reset
+// ============================================
+
+model PasswordResetToken {
+    id        String   @id @default(uuid()) @db.Uuid
+    userId    String   @map("user_id") @db.Uuid
+    token     String   @unique @db.VarChar(255)
+    expiresAt DateTime @map("expires_at") @db.Timestamp(6)
+    createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+
+    // Relations
+    user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@index([userId])
+    @@map("password_reset_tokens")
+}
+
+// ============================================
+// Refresh Tokens
+// ============================================
+
+model RefreshToken {
+    id        String   @id @default(uuid()) @db.Uuid
+    userId    String   @map("user_id") @db.Uuid
+    token     String   @db.VarChar(500)
+    expiresAt DateTime @map("expires_at") @db.Timestamp(6)
+    createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+
+    // Relations
+    user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+    @@index([userId])
+    @@index([token])
+    @@map("refresh_tokens")
+}
