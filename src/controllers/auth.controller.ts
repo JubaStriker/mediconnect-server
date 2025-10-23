@@ -1,7 +1,7 @@
 // src/controllers/auth.controller.ts
 import { Request, Response } from 'express';
 import { AuthService } from '../services/auth.services';
-import pool from '../config/database';
+import prisma from '../lib/prisma';
 
 const authService = new AuthService();
 
@@ -26,7 +26,7 @@ export class AuthController {
                     httpOnly: true,
                     secure: process.env.NODE_ENV === 'production',
                     sameSite: 'strict',
-                    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+                    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
                 });
             }
 
@@ -38,7 +38,7 @@ export class AuthController {
 
     async setup2FA(req: Request, res: Response) {
         try {
-            const userId = req.user!.userId || '';
+            const userId = req.user!.userId;
             const result = await authService.setup2FA(userId);
             res.json(result);
         } catch (error: any) {
@@ -57,6 +57,17 @@ export class AuthController {
         }
     }
 
+    async disable2FA(req: Request, res: Response) {
+        try {
+            const userId = req.user!.userId;
+            const { password } = req.body;
+            const result = await authService.disable2FA(userId, password);
+            res.json(result);
+        } catch (error: any) {
+            res.status(400).json({ error: error.message });
+        }
+    }
+
     async verify2FALogin(req: Request, res: Response) {
         try {
             const { tempToken, token } = req.body;
@@ -66,7 +77,7 @@ export class AuthController {
                 httpOnly: true,
                 secure: process.env.NODE_ENV === 'production',
                 sameSite: 'strict',
-                maxAge: 7 * 24 * 60 * 60 * 1000
+                maxAge: 7 * 24 * 60 * 60 * 1000,
             });
 
             res.json(result);
@@ -79,6 +90,16 @@ export class AuthController {
         try {
             const { token } = req.params;
             const result = await authService.verifyEmail(token);
+            res.json(result);
+        } catch (error: any) {
+            res.status(400).json({ error: error.message });
+        }
+    }
+
+    async resendVerificationEmail(req: Request, res: Response) {
+        try {
+            const { email } = req.body;
+            const result = await authService.resendVerificationEmail(email);
             res.json(result);
         } catch (error: any) {
             res.status(400).json({ error: error.message });
@@ -115,40 +136,43 @@ export class AuthController {
         }
     }
 
+    async logoutAllDevices(req: Request, res: Response) {
+        try {
+            const userId = req.user!.userId;
+            const result = await authService.logoutAllDevices(userId);
+
+            res.clearCookie('refreshToken');
+            res.json(result);
+        } catch (error: any) {
+            res.status(400).json({ error: error.message });
+        }
+    }
+
     async getProfile(req: Request, res: Response) {
         try {
             const userId = req.user!.userId;
             const role = req.user!.role;
 
-            // Get user details
-            const userResult = await pool.query(
-                'SELECT id, email, role, is_email_verified, two_factor_enabled FROM users WHERE id = $1',
-                [userId]
-            );
+            // Get user with profile
+            const user = await prisma.user.findUnique({
+                where: { id: userId },
+                select: {
+                    id: true,
+                    email: true,
+                    role: true,
+                    isEmailVerified: true,
+                    twoFactorEnabled: true,
+                    createdAt: true,
+                    doctorProfile: role === 'doctor',
+                    patientProfile: role === 'patient',
+                },
+            });
 
-            if (userResult.rows.length === 0) {
+            if (!user) {
                 return res.status(404).json({ error: 'User not found' });
             }
 
-            const user = userResult.rows[0];
-
-            // Get profile based on role
-            let profile;
-            if (role === 'doctor') {
-                const profileResult = await pool.query(
-                    'SELECT * FROM doctor_profiles WHERE user_id = $1',
-                    [userId]
-                );
-                profile = profileResult.rows[0];
-            } else {
-                const profileResult = await pool.query(
-                    'SELECT * FROM patient_profiles WHERE user_id = $1',
-                    [userId]
-                );
-                profile = profileResult.rows[0];
-            }
-
-            res.json({ user, profile });
+            res.json(user);
         } catch (error: any) {
             res.status(400).json({ error: error.message });
         }
